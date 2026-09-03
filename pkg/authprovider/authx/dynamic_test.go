@@ -249,7 +249,7 @@ func TestDynamicFetchReentry(t *testing.T) {
 		select {
 		case err := <-done:
 			require.NoError(t, err)
-			require.NoError(t, nestedErr)
+			require.NoError(t, nestedErr, "nested Fetch should not deadlock and should return immediately")
 		case <-time.After(2 * time.Second):
 			t.Fatal("Fetch deadlocked on re-entry")
 		}
@@ -273,7 +273,7 @@ func TestDynamicFetchReentry(t *testing.T) {
 			strategy := &DynamicAuthStrategy{Dynamic: *dynamic}
 			strategy.Apply(req)
 			require.Empty(t, req.Header.Get("X-Token"), "login request must not receive secret-file auth during fetch")
-			require.Nil(t, dynamic.GetStrategies())
+			require.Nil(t, dynamic.GetStrategies(), "nested GetStrategies should return nil to avoid re-entry deadlock")
 			dynamic.Extracted = map[string]interface{}{"token": "abc"}
 			return nil
 		})

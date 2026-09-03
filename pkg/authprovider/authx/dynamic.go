@@ -1,13 +1,10 @@
 package authx
 
 import (
-	"bytes"
 	"fmt"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/replacer"
@@ -20,12 +17,13 @@ type LazyFetchSecret func(d *Dynamic) error
 
 // fetchState holds the sync.Once and error for thread-safe fetching.
 // This is stored as a pointer in Dynamic so that value copies share the same state.
+// fetchingGoroutineID tracks which goroutine is currently executing the fetch,
+// allowing recursive calls from that same goroutine to bypass sync.Once safely.
 type fetchState struct {
-	once sync.Once
-	err  error
-	// owner is the goroutine running the fetch callback. Nested Fetch/GetStrategies
-	// on that goroutine must not wait on once (sync.Once deadlocks on re-entry).
-	owner atomic.Int64
+	once                sync.Once
+	err                 error
+	fetchingGoroutineID uint64
+	mu                  sync.Mutex
 }
 
 var (
@@ -200,7 +198,7 @@ func (d *Dynamic) applyValuesToSecret(secret *Secret) error {
 func (d *Dynamic) GetStrategies() []AuthStrategy {
 	// Nested lookup from inside the fetch callback (login template ApplyAuth)
 	// must not wait on Fetch and must not apply still-unresolved secrets.
-	if d.fetchingOnThisGoroutine() {
+	if d.isRecursiveFetch() {
 		return nil
 	}
 	// Ensure fetch has completed before returning strategies.
@@ -231,13 +229,19 @@ func (d *Dynamic) Fetch(isFatal bool) error {
 		return errkit.New("dynamic secret not validated: call Validate() before Fetch()")
 	}
 
-	if d.fetchingOnThisGoroutine() {
+	if d.isRecursiveFetch() {
 		return d.fetchState.err
 	}
 
 	d.fetchState.once.Do(func() {
-		d.fetchState.owner.Store(goroutineID())
-		defer d.fetchState.owner.Store(0)
+		d.fetchState.mu.Lock()
+		d.fetchState.fetchingGoroutineID = getGoroutineID()
+		d.fetchState.mu.Unlock()
+		defer func() {
+			d.fetchState.mu.Lock()
+			d.fetchState.fetchingGoroutineID = 0
+			d.fetchState.mu.Unlock()
+		}()
 		if d.fetchCallback == nil {
 			d.fetchState.err = errkit.New("dynamic secret fetch callback not set: call SetLazyFetchCallback() before Fetch()")
 			return
@@ -258,31 +262,22 @@ func (d *Dynamic) Error() error {
 	}
 	return d.fetchState.err
 }
-
-func (d *Dynamic) fetchingOnThisGoroutine() bool {
+func (d *Dynamic) isRecursiveFetch() bool {
 	if d == nil || d.fetchState == nil {
 		return false
 	}
-	owner := d.fetchState.owner.Load()
-	return owner != 0 && owner == goroutineID()
+	d.fetchState.mu.Lock()
+	defer d.fetchState.mu.Unlock()
+	// Return true if fetch is in progress and we're in the same goroutine
+	return d.fetchState.fetchingGoroutineID != 0 && d.fetchState.fetchingGoroutineID == getGoroutineID()
 }
 
-func goroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	s := buf[:n]
-	const prefix = "goroutine "
-	if !bytes.HasPrefix(s, []byte(prefix)) {
-		return 0
-	}
-	s = s[len(prefix):]
-	i := bytes.IndexByte(s, ' ')
-	if i <= 0 {
-		return 0
-	}
-	id, err := strconv.ParseInt(string(s[:i]), 10, 64)
-	if err != nil {
-		return 0
-	}
+// getGoroutineID returns the current goroutine ID in a thread-safe manner.
+// This uses the runtime package to introspect goroutine info.
+func getGoroutineID() uint64 {
+	b := make([]byte, 64)
+	runtime.Stack(b, false)
+	var id uint64
+	fmt.Sscanf(string(b), "goroutine %d", &id)
 	return id
 }
